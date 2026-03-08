@@ -35,5 +35,6 @@ export type PipelineJobData = {
   runId: string;
   startStage?: "SCRAPE" | "KEYWORDS" | "REDDIT_FETCH" | "AI_EXTRACT" | "CLUSTER";
   resetData?: boolean;
+  orgId?: string;
 };
 

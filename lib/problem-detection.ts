@@ -1,5 +1,13 @@
 import { prisma } from "@/lib/prisma";
-import { extractProblemFromRedditPost } from "@/lib/openai";
+import { extractProblemFromPost } from "@/lib/openai";
+
+function contactHint(text: string) {
+  const emailMatch = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  if (emailMatch) return emailMatch[0];
+  const urlMatch = text.match(/https?:\/\/[^\s)]+/i);
+  if (urlMatch) return urlMatch[0];
+  return null;
+}
 
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -40,11 +48,12 @@ export async function analyzePostsForProject(params: {
   });
 
   const extracted = await mapWithConcurrency(posts, concurrency, async (p) => {
-    const result = await extractProblemFromRedditPost({
+    const result = await extractProblemFromPost({
       title: p.title,
       content: p.content,
       author: p.author,
       subreddit: p.subreddit,
+      source: p.source,
       upvotes: p.upvotes,
       comments: p.comments,
       postUrl: p.postUrl,
@@ -52,17 +61,30 @@ export async function analyzePostsForProject(params: {
 
     return {
       postId: p.id,
+      upvotes: p.upvotes,
+      comments: p.comments,
+      createdAt: p.redditCreatedAt,
+      contact: contactHint(p.content),
       ...result,
     };
   });
 
   const toCreate = extracted
     .filter((r) => r.problemText)
-    .map((r) => ({
-      postId: r.postId,
-      problemText: r.problemText as string,
-      confidenceScore: r.confidenceScore ?? 0.5,
-    }));
+    .map((r) => {
+      const ageDays = r.createdAt ? Math.max(1, (Date.now() - new Date(r.createdAt).getTime()) / 86_400_000) : 30;
+      const severity = Math.min(1, (r.upvotes / 50 + r.comments / 20 + (r.confidenceScore ?? 0.5)) / 3);
+      const trendScore = Math.max(0, Math.min(1, (r.upvotes + r.comments) / (ageDays * 10)));
+      return {
+        postId: r.postId,
+        problemText: r.problemText as string,
+        confidenceScore: r.confidenceScore ?? 0.5,
+        severityScore: severity,
+        trendScore,
+        evidenceCount: 1,
+        contactHint: r.contact,
+      };
+    });
 
   const beforeCount = await prisma.problem.count({
     where: { post: { projectId: params.projectId } },

@@ -22,6 +22,7 @@ export type OpenAIWebPost = {
 export async function searchOpenAIWebPosts(params: {
   keyword: string;
   limit?: number;
+  sourceHint?: string;
 }): Promise<OpenAIWebPost[]> {
   const keyword = params.keyword.trim();
   if (!keyword) return [];
@@ -29,6 +30,7 @@ export async function searchOpenAIWebPosts(params: {
 
   const prompt = [
     "Search the public web (Reddit allowed) for recent posts matching this keyword.",
+    params.sourceHint ? `Prefer results from: ${params.sourceHint}.` : "",
     "Return EXACT JSON (no code fences, no markdown). Shape:",
     '[{ "title": string, "selftext": string, "author": string, "subreddit": string, "upvotes": number, "comments": number, "post_url": string, "created_at": string|null }]',
     `Rules (max ${limit} items):`,

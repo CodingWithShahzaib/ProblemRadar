@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
+import { getServerSession } from "next-auth";
 import { prisma } from "@/lib/prisma";
+import { authOptions } from "@/lib/auth";
+import { requireOrgContext } from "@/lib/billing";
 
 const DEFAULT_INTERVAL = 2000;
 
@@ -19,6 +22,10 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const { orgId: userOrgId } = await requireOrgContext(session.user.id);
+
   const { id } = await params;
 
   let closeRef: null | (() => void) = null;
@@ -64,6 +71,7 @@ export async function GET(
             where: { id },
             select: {
               id: true,
+              orgId: true,
               url: true,
               createdAt: true,
               status: true,
@@ -79,6 +87,11 @@ export async function GET(
           if (!alive) return;
           if (!project) {
             safeEnqueue(`event: error\ndata: ${JSON.stringify({ error: "not_found" })}\n\n`);
+            close();
+            return;
+          }
+          if (project.orgId && project.orgId !== userOrgId) {
+            safeEnqueue(`event: error\ndata: ${JSON.stringify({ error: "forbidden" })}\n\n`);
             close();
             return;
           }

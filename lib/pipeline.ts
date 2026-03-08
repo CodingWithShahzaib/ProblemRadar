@@ -1,10 +1,13 @@
-import { ProjectStage } from "@prisma/client";
+import { PostSource, ProjectStage } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { extractKeywordsFromUrlWithOpenAIWeb } from "@/lib/keywords-openai-web";
-import { searchRedditPosts } from "@/lib/reddit";
-import { searchOpenAIWebPosts } from "./search-openai-web";
 import { analyzePostsForProject } from "@/lib/problem-detection";
 import { clusterProblemsForProject } from "@/lib/clustering";
+import { fetchPostsFromSource, type IngestionSource } from "@/lib/sources";
+import { bumpUsage, getOrgPlan, assertPostAndProblemLimits } from "@/lib/billing";
+import { defaultPlan } from "@/lib/plan";
+import { audit } from "@/lib/audit";
+import { sendSlackAlert } from "@/lib/alerts";
 
 async function setProjectState(projectId: string, data: Parameters<typeof prisma.project.update>[0]["data"]) {
   await prisma.project.update({ where: { id: projectId }, data });
@@ -91,8 +94,29 @@ export async function runProjectPipeline(
     await setRunState(opts?.runId, { status: "RUNNING", stage: "SCRAPE", errorMessage: null });
     await logRun(opts?.runId, "SCRAPE", "Run started");
 
-    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: {
+        id: true,
+        url: true,
+        orgId: true,
+        sourcesJson: true,
+        keywordsJson: true,
+      },
+    });
     if (!project) throw new Error("Project not found.");
+    const plan = project.orgId ? (await getOrgPlan(project.orgId)).plan : defaultPlan();
+    const sources: IngestionSource[] = (() => {
+      try {
+        const parsed = project.sourcesJson ? (JSON.parse(project.sourcesJson) as string[]) : [];
+        const validSources = parsed.filter((s): s is IngestionSource =>
+          ["REDDIT", "OPENAI_WEB", "X", "HACKER_NEWS", "PRODUCT_HUNT", "G2", "APP_STORE"].includes(s)
+        );
+        return validSources.length > 0 ? validSources : ["REDDIT"];
+      } catch {
+        return ["REDDIT"];
+      }
+    })();
 
     const startStage = opts?.startStage ?? "SCRAPE";
 
@@ -140,53 +164,60 @@ export async function runProjectPipeline(
 
     if (shouldFetchReddit) {
       for (const keyword of keywords) {
-        await logRun(opts?.runId, "REDDIT_FETCH", `Searching posts for "${keyword}"`);
-        const results = await withRetry(
-          () =>
-            project.searchSource === "OPENAI_WEB"
-              ? searchOpenAIWebPosts({ keyword, limit: perKeywordLimit })
-              : searchRedditPosts({ keyword, limit: perKeywordLimit }),
-          project.searchSource === "OPENAI_WEB" ? "openai-web-search" : "reddit-search"
-        );
-        if (results.length === 0) continue;
+        for (const source of sources) {
+          await logRun(opts?.runId, "REDDIT_FETCH", `Searching ${source} for "${keyword}"`);
+          const results = await withRetry(
+            () => fetchPostsFromSource(source, keyword, perKeywordLimit),
+            `source-${source.toLowerCase()}`
+          );
+          if (results.length === 0) continue;
 
-        for (const p of results) {
-          const postUrl = p.post_url?.trim();
-          if (!postUrl) continue;
+          if (project.orgId) {
+            await assertPostAndProblemLimits(project.orgId, plan, results.length);
+          }
+          for (const p of results) {
+            const postUrl = p.post_url?.trim();
+            if (!postUrl) continue;
+            if ((p.selftext ?? "").length < 20 && (p.title ?? "").length < 10) continue; // spam filter
 
-          await prisma.post.upsert({
-            where: { projectId_postUrl: { projectId, postUrl } },
-            create: {
-              projectId,
-              title: p.title,
-              content: p.selftext,
-              author: p.author,
-              subreddit: p.subreddit,
-              upvotes: p.upvotes,
-              comments: p.comments,
-              postUrl,
-              redditCreatedAt: safeDate(p.created_at),
-              matchedKeyword: keyword,
-            },
-            update: {
-              title: p.title,
-              content: p.selftext,
-              author: p.author,
-              subreddit: p.subreddit,
-              upvotes: p.upvotes,
-              comments: p.comments,
-              redditCreatedAt: safeDate(p.created_at),
-              matchedKeyword: keyword,
-            },
-          });
+            await prisma.post.upsert({
+              where: { projectId_postUrl: { projectId, postUrl } },
+              create: {
+                projectId,
+                title: p.title,
+                content: p.selftext,
+                author: p.author,
+                subreddit: p.subreddit,
+                source: source as PostSource,
+                upvotes: p.upvotes,
+                comments: p.comments,
+                postUrl,
+                redditCreatedAt: safeDate(p.created_at),
+                matchedKeyword: keyword,
+              },
+              update: {
+                title: p.title,
+                content: p.selftext,
+                author: p.author,
+                subreddit: p.subreddit,
+                source: source as PostSource,
+                upvotes: p.upvotes,
+                comments: p.comments,
+                redditCreatedAt: safeDate(p.created_at),
+                matchedKeyword: keyword,
+              },
+            });
+          }
+
+          if (project.orgId) {
+            await bumpUsage(project.orgId, { postsFetched: results.length });
+          }
+          const postCount = await prisma.post.count({ where: { projectId } });
+          await setProjectState(projectId, { postCount });
+          await setRunState(opts?.runId, { stage: "REDDIT_FETCH" });
+
+          await sleep(250);
         }
-
-        const postCount = await prisma.post.count({ where: { projectId } });
-        await setProjectState(projectId, { postCount });
-        await setRunState(opts?.runId, { stage: "REDDIT_FETCH" });
-
-        // Small delay to reduce rate-limit risk.
-        await sleep(350);
       }
     }
 
@@ -208,6 +239,9 @@ export async function runProjectPipeline(
           batchSize: 10,
           concurrency: 5,
         });
+        if (project.orgId && result.created > 0) {
+          await bumpUsage(project.orgId, { problemsExtracted: result.created });
+        }
         await logRun(
           opts?.runId,
           "AI_EXTRACT",
@@ -228,6 +262,17 @@ export async function runProjectPipeline(
     });
     await setRunState(opts?.runId, { status: "DONE", stage: "DONE" });
     await logRun(opts?.runId, "DONE", "Run completed");
+
+    if (project.orgId) {
+      await sendSlackAlert(`ProblemRadar run complete for ${project.url} (${project.orgId}). Clusters: ${(await prisma.cluster.count({ where: { projectId } }))}.`);
+    }
+
+    await audit({
+      orgId: project.orgId ?? null,
+      action: "pipeline.complete",
+      target: projectId,
+      metadata: { runId: opts?.runId ?? null },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Pipeline failed.";
     await setProjectState(projectId, {

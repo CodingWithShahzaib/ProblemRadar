@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
+import { getServerSession } from "next-auth";
 import { prisma } from "@/lib/prisma";
+import { authOptions } from "@/lib/auth";
+import { requireOrgContext } from "@/lib/billing";
 
 function parseKeywords(json: string | null) {
   if (!json) return [];
@@ -13,10 +16,26 @@ function parseKeywords(json: string | null) {
   }
 }
 
+function parseSources(json: string | null) {
+  if (!json) return ["REDDIT"];
+  try {
+    const arr = JSON.parse(json) as unknown;
+    if (!Array.isArray(arr)) return ["REDDIT"];
+    return arr.map((x) => String(x)).filter(Boolean);
+  } catch {
+    return ["REDDIT"];
+  }
+}
+
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const { orgId: userOrgId } = await requireOrgContext(session.user.id);
+
   const { id } = await params;
   const url = new URL(req.url);
   const postLimit = Math.min(200, Math.max(1, Number(url.searchParams.get("postLimit")) || 50));
@@ -32,6 +51,7 @@ export async function GET(
       id: true,
       url: true,
       createdAt: true,
+      orgId: true,
       status: true,
       stage: true,
       errorMessage: true,
@@ -40,10 +60,14 @@ export async function GET(
       postCount: true,
       problemCount: true,
       clusterCount: true,
+      sourcesJson: true,
     },
   });
 
   if (!project) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  if (project.orgId && project.orgId !== userOrgId) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
 
   const [clusters, runs, posts, problems, logs] = await Promise.all([
     prisma.cluster.findMany({
@@ -103,10 +127,22 @@ export async function GET(
     }),
   ]);
 
+  const sortedRuns = runs.slice().sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  const latest = sortedRuns[0];
+  const prev = sortedRuns[1];
+  const runDiff = latest && prev
+    ? {
+        runId: latest.id,
+        deltaProblems: project.problemCount - (prev ? project.problemCount : 0),
+        deltaPosts: project.postCount,
+      }
+    : null;
+
   return NextResponse.json({
     project: {
       ...project,
       keywords: parseKeywords(project.keywordsJson),
+      sources: parseSources(project.sourcesJson),
     },
     runs,
     clusters: clusters.map(
@@ -122,6 +158,7 @@ export async function GET(
       content: p.content,
       author: p.author,
       subreddit: p.subreddit,
+      source: p.source,
       upvotes: p.upvotes,
       comments: p.comments,
       postUrl: p.postUrl,
@@ -132,6 +169,10 @@ export async function GET(
             id: p.problem.id,
             problemText: p.problem.problemText,
             confidenceScore: p.problem.confidenceScore,
+            severityScore: p.problem.severityScore,
+            trendScore: p.problem.trendScore,
+            evidenceCount: p.problem.evidenceCount,
+            contactHint: p.problem.contactHint,
             cluster: p.problem.cluster
               ? { id: p.problem.cluster.id, clusterName: p.problem.cluster.clusterName }
               : null,
@@ -142,12 +183,17 @@ export async function GET(
       id: p.id,
       problemText: p.problemText,
       confidenceScore: p.confidenceScore,
+      severityScore: p.severityScore,
+      trendScore: p.trendScore,
+      evidenceCount: p.evidenceCount,
+      contactHint: p.contactHint,
       cluster: p.cluster ? { id: p.cluster.id, clusterName: p.cluster.clusterName } : null,
       subreddit: p.post.subreddit,
       author: p.post.author,
       postUrl: p.post.postUrl,
     })),
     logs,
+    runDiff,
   });
 }
 

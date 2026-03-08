@@ -50,10 +50,11 @@ export async function embedTexts(texts: string[]) {
   return (res.data ?? []).map((d) => d.embedding);
 }
 
-export async function extractProblemFromRedditPost(input: {
+export async function extractProblemFromPost(input: {
   title: string;
   content: string;
   subreddit: string;
+  source?: string;
   author: string;
   upvotes: number;
   comments: number;
@@ -63,7 +64,8 @@ export async function extractProblemFromRedditPost(input: {
   const openai = getOpenAI();
 
   const prompt = [
-    "Extract the main problem or pain point expressed in this Reddit post.",
+    "Extract the main problem or pain point expressed in this post.",
+    "Sources can be Reddit, Hacker News, Product Hunt, G2, App Store, X/Twitter, or generic web.",
     "If no problem exists, return null for problemText and confidenceScore.",
     "",
     "Return ONLY valid JSON (no markdown, no extra keys) in this shape:",
@@ -76,6 +78,7 @@ export async function extractProblemFromRedditPost(input: {
 
   const user = [
     `subreddit: ${input.subreddit}`,
+    `source: ${input.source ?? "unknown"}`,
     `author: ${input.author}`,
     `upvotes: ${input.upvotes}`,
     `comments: ${input.comments}`,
