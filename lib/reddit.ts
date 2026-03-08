@@ -93,7 +93,8 @@ export async function searchRedditPosts(params: {
     validateStatus: (s) => s >= 200 && s < 400,
   });
 
-  const children: any[] = res.data?.data?.children ?? [];
+  type Child = { data?: Record<string, unknown> };
+  const children = (res.data?.data?.children ?? []) as Child[];
   const normalized: RedditSearchResult[] = [];
 
   for (const c of children) {

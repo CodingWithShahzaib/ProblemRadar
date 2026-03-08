@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { prisma } from "@/lib/prisma";
 import { runProjectPipeline, type PipelineStartStage } from "@/lib/pipeline";
+import { pipelineQueue } from "@/lib/job-queue";
 
 const STAGES: readonly PipelineStartStage[] = [
   "SCRAPE",
@@ -43,9 +44,22 @@ export async function POST(req: Request) {
       data: { status: "PENDING", stage: "QUEUED", errorMessage: null },
     });
 
-    runProjectPipeline(projectId, { startStage, resetData }).catch(() => {});
+    const run = await prisma.projectRun.create({
+      data: { projectId, status: "PENDING", stage: "QUEUED" },
+      select: { id: true },
+    });
 
-    return NextResponse.json({ ok: true });
+    if (pipelineQueue) {
+      await pipelineQueue.add(
+        "pipeline",
+        { projectId, runId: run.id, startStage, resetData },
+        { jobId: run.id }
+      );
+    } else {
+      runProjectPipeline(projectId, { runId: run.id, startStage, resetData }).catch(() => {});
+    }
+
+    return NextResponse.json({ ok: true, runId: run.id });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Rerun failed.";
     return NextResponse.json({ error: message }, { status: 500 });

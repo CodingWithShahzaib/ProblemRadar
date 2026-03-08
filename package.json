@@ -6,12 +6,14 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "worker": "ts-node -P tsconfig.worker.json -r tsconfig-paths/register queue/worker.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.2.0",
     "@prisma/client": "^6.19.2",
     "axios": "^1.13.6",
+    "bullmq": "^5.30.2",
     "cheerio": "^1.2.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -34,6 +36,7 @@
     "eslint-config-next": "16.1.6",
     "prisma": "^6.19.2",
     "tailwindcss": "^4",
+    "ts-node": "^10.9.2",
     "typescript": "^5"
   }
 }

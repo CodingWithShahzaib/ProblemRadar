@@ -14,10 +14,17 @@ function parseKeywords(json: string | null) {
 }
 
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const url = new URL(req.url);
+  const postLimit = Math.min(200, Math.max(1, Number(url.searchParams.get("postLimit")) || 50));
+  const postOffset = Math.max(0, Number(url.searchParams.get("postOffset")) || 0);
+  const postSortBy = url.searchParams.get("postSortBy") ?? "upvotes";
+  const postSortDir = url.searchParams.get("postSortDir") === "asc" ? "asc" : "desc";
+  const problemLimit = Math.min(200, Math.max(1, Number(url.searchParams.get("problemLimit")) || 100));
+  const problemOffset = Math.max(0, Number(url.searchParams.get("problemOffset")) || 0);
 
   const project = await prisma.project.findUnique({
     where: { id },
@@ -38,7 +45,7 @@ export async function GET(
 
   if (!project) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const [clusters, posts] = await Promise.all([
+  const [clusters, runs, posts, problems, logs] = await Promise.all([
     prisma.cluster.findMany({
       where: { projectId: id },
       orderBy: { createdAt: "asc" },
@@ -48,12 +55,50 @@ export async function GET(
         _count: { select: { problems: true } },
       },
     }),
+    prisma.projectRun.findMany({
+      where: { projectId: id },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+      select: {
+        id: true,
+        status: true,
+        stage: true,
+        errorMessage: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    }),
     prisma.post.findMany({
       where: { projectId: id },
-      orderBy: { upvotes: "desc" },
-      take: 200,
+      orderBy:
+        postSortBy === "comments"
+          ? { comments: postSortDir }
+          : postSortBy === "date"
+            ? { redditCreatedAt: postSortDir }
+            : { upvotes: postSortDir },
+      take: postLimit,
+      skip: postOffset,
       include: {
         problem: { include: { cluster: true } },
+      },
+    }),
+    prisma.problem.findMany({
+      where: { post: { projectId: id } },
+      orderBy: { confidenceScore: "desc" },
+      take: problemLimit,
+      skip: problemOffset,
+      include: { cluster: true, post: { select: { subreddit: true, author: true, postUrl: true } } },
+    }),
+    prisma.projectRunLog.findMany({
+      where: { run: { projectId: id } },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+      select: {
+        id: true,
+        runId: true,
+        stage: true,
+        message: true,
+        createdAt: true,
       },
     }),
   ]);
@@ -63,12 +108,13 @@ export async function GET(
       ...project,
       keywords: parseKeywords(project.keywordsJson),
     },
+    runs,
     clusters: clusters.map(
       (c: { id: string; clusterName: string; _count: { problems: number } }) => ({
-      id: c.id,
-      clusterName: c.clusterName,
-      problemCount: c._count.problems,
-    })
+        id: c.id,
+        clusterName: c.clusterName,
+        problemCount: c._count.problems,
+      })
     ),
     posts: posts.map((p) => ({
       id: p.id,
@@ -92,6 +138,16 @@ export async function GET(
           }
         : null,
     })),
+    problems: problems.map((p) => ({
+      id: p.id,
+      problemText: p.problemText,
+      confidenceScore: p.confidenceScore,
+      cluster: p.cluster ? { id: p.cluster.id, clusterName: p.cluster.clusterName } : null,
+      subreddit: p.post.subreddit,
+      author: p.post.author,
+      postUrl: p.post.postUrl,
+    })),
+    logs,
   });
 }
 

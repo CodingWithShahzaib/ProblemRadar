@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["queue/**/*.ts", "lib/**/*.ts", "prisma/**/*.ts"]
+}
+

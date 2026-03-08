@@ -1,12 +1,36 @@
+import { ProjectStage } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { scrapeWebsite } from "@/lib/scrape";
-import { extractKeywordsFromWebsite } from "@/lib/keywords";
+import { extractKeywordsFromUrlWithOpenAIWeb } from "@/lib/keywords-openai-web";
 import { searchRedditPosts } from "@/lib/reddit";
+import { searchOpenAIWebPosts } from "./search-openai-web";
 import { analyzePostsForProject } from "@/lib/problem-detection";
 import { clusterProblemsForProject } from "@/lib/clustering";
 
 async function setProjectState(projectId: string, data: Parameters<typeof prisma.project.update>[0]["data"]) {
   await prisma.project.update({ where: { id: projectId }, data });
+}
+
+async function setRunState(
+  runId: string | null | undefined,
+  data: Parameters<typeof prisma.projectRun.update>[0]["data"]
+) {
+  if (!runId) return;
+  try {
+    await prisma.projectRun.update({ where: { id: runId }, data });
+  } catch {
+    // ignore if run missing
+  }
+}
+
+async function logRun(runId: string | null | undefined, stage: ProjectStage, message: string) {
+  if (!runId) return;
+  try {
+    await prisma.projectRunLog.create({
+      data: { runId, stage, message },
+    });
+  } catch {
+    // swallow logging issues
+  }
 }
 
 async function sleep(ms: number) {
@@ -20,9 +44,32 @@ export type PipelineStartStage =
   | "AI_EXTRACT"
   | "CLUSTER";
 
+function safeDate(input: string | null | undefined) {
+  if (!input) return null;
+  const d = new Date(input);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function withRetry<T>(fn: () => Promise<T>, label: string, attempts = 3, baseDelay = 800) {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const delay = baseDelay * Math.pow(2, i) + Math.random() * 150;
+      console.warn(`[pipeline:${label}] attempt ${i + 1} failed; retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(label ? `Failed after retries: ${label}` : "Failed after retries");
+}
+
 export async function runProjectPipeline(
   projectId: string,
-  opts?: { startStage?: PipelineStartStage; resetData?: boolean }
+  opts?: { startStage?: PipelineStartStage; resetData?: boolean; runId?: string }
 ) {
   try {
     if (opts?.resetData) {
@@ -41,6 +88,8 @@ export async function runProjectPipeline(
       stage: "SCRAPE",
       errorMessage: null,
     });
+    await setRunState(opts?.runId, { status: "RUNNING", stage: "SCRAPE", errorMessage: null });
+    await logRun(opts?.runId, "SCRAPE", "Run started");
 
     const project = await prisma.project.findUnique({ where: { id: projectId } });
     if (!project) throw new Error("Project not found.");
@@ -53,11 +102,16 @@ export async function runProjectPipeline(
 
     if (needsScrapeAndKeywords) {
       await setProjectState(projectId, { stage: "SCRAPE" });
-      const scraped = await scrapeWebsite(project.url);
+      await logRun(opts?.runId, "SCRAPE", "Discovering website (OpenAI web search)");
 
       await setProjectState(projectId, { stage: "KEYWORDS" });
-      const extracted = extractKeywordsFromWebsite(scraped);
-      keywords = extracted.keywords;
+      await logRun(opts?.runId, "KEYWORDS", "Extracting keywords (OpenAI web search)");
+
+      const keywordLimit = Number(process.env.KEYWORD_LIMIT) || 20;
+      keywords = await withRetry(
+        () => extractKeywordsFromUrlWithOpenAIWeb({ url: project.url, limit: keywordLimit }),
+        "openai-keywords"
+      );
 
       await setProjectState(projectId, {
         keywordsJson: JSON.stringify(keywords),
@@ -86,12 +140,22 @@ export async function runProjectPipeline(
 
     if (shouldFetchReddit) {
       for (const keyword of keywords) {
-        const results = await searchRedditPosts({ keyword, limit: perKeywordLimit });
+        await logRun(opts?.runId, "REDDIT_FETCH", `Searching posts for "${keyword}"`);
+        const results = await withRetry(
+          () =>
+            project.searchSource === "OPENAI_WEB"
+              ? searchOpenAIWebPosts({ keyword, limit: perKeywordLimit })
+              : searchRedditPosts({ keyword, limit: perKeywordLimit }),
+          project.searchSource === "OPENAI_WEB" ? "openai-web-search" : "reddit-search"
+        );
         if (results.length === 0) continue;
 
         for (const p of results) {
+          const postUrl = p.post_url?.trim();
+          if (!postUrl) continue;
+
           await prisma.post.upsert({
-            where: { projectId_postUrl: { projectId, postUrl: p.post_url } },
+            where: { projectId_postUrl: { projectId, postUrl } },
             create: {
               projectId,
               title: p.title,
@@ -100,8 +164,8 @@ export async function runProjectPipeline(
               subreddit: p.subreddit,
               upvotes: p.upvotes,
               comments: p.comments,
-              postUrl: p.post_url,
-              redditCreatedAt: new Date(p.created_at),
+              postUrl,
+              redditCreatedAt: safeDate(p.created_at),
               matchedKeyword: keyword,
             },
             update: {
@@ -111,7 +175,7 @@ export async function runProjectPipeline(
               subreddit: p.subreddit,
               upvotes: p.upvotes,
               comments: p.comments,
-              redditCreatedAt: new Date(p.created_at),
+              redditCreatedAt: safeDate(p.created_at),
               matchedKeyword: keyword,
             },
           });
@@ -119,6 +183,7 @@ export async function runProjectPipeline(
 
         const postCount = await prisma.post.count({ where: { projectId } });
         await setProjectState(projectId, { postCount });
+        await setRunState(opts?.runId, { stage: "REDDIT_FETCH" });
 
         // Small delay to reduce rate-limit risk.
         await sleep(350);
@@ -126,6 +191,7 @@ export async function runProjectPipeline(
     }
 
     await setProjectState(projectId, { stage: "AI_EXTRACT" });
+    await setRunState(opts?.runId, { stage: "AI_EXTRACT" });
     const hasProblems =
       (await prisma.problem.count({ where: { post: { projectId } } })) > 0;
     const shouldAnalyze =
@@ -142,17 +208,26 @@ export async function runProjectPipeline(
           batchSize: 10,
           concurrency: 5,
         });
+        await logRun(
+          opts?.runId,
+          "AI_EXTRACT",
+          `Analyzed batch (${result.created} new problems; done=${result.done})`
+        );
         if (result.done) break;
       }
     }
 
     await setProjectState(projectId, { stage: "CLUSTER" });
     await clusterProblemsForProject({ projectId });
+    await setRunState(opts?.runId, { stage: "CLUSTER" });
+    await logRun(opts?.runId, "CLUSTER", "Clustering problems");
 
     await setProjectState(projectId, {
       status: "DONE",
       stage: "DONE",
     });
+    await setRunState(opts?.runId, { status: "DONE", stage: "DONE" });
+    await logRun(opts?.runId, "DONE", "Run completed");
   } catch (err) {
     const message = err instanceof Error ? err.message : "Pipeline failed.";
     await setProjectState(projectId, {
@@ -160,6 +235,8 @@ export async function runProjectPipeline(
       stage: "ERROR",
       errorMessage: message,
     });
+    await setRunState(opts?.runId, { status: "ERROR", stage: "ERROR", errorMessage: message });
+    await logRun(opts?.runId, "ERROR", message);
   }
 }
 
